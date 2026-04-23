@@ -1,0 +1,46 @@
+[
+  {
+    "name": "volume_rank",
+    "enabled": true,
+    "path": "/uapi/domestic-stock/v1/quotations/volume-rank",
+    "tr_id": "FHPST01710000",
+    "params": {
+      "FID_COND_MRKT_DIV_CODE": "J",
+      "FID_COND_SCR_DIV_CODE": "20171",
+      "FID_INPUT_ISCD": "0000",
+      "FID_DIV_CLS_CODE": "0",
+      "FID_BLNG_CLS_CODE": "3",
+      "FID_TRGT_CLS_CODE": "111111111",
+      "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+      "FID_INPUT_PRICE_1": "",
+      "FID_INPUT_PRICE_2": "",
+      "FID_VOL_CNT": "",
+      "FID_INPUT_DATE_1": ""
+    }
+  },
+  {
+    "name": "expected_updown",
+    "enabled": true,
+    "path": "/uapi/domestic-stock/v1/ranking/exp-trans-updown",
+    "tr_id": "FHPST01820000",
+    "params": {
+      "fid_rank_sort_cls_code": "0",
+      "fid_cond_mrkt_div_code": "J",
+      "fid_cond_scr_div_code": "20182",
+      "fid_input_iscd": "0000",
+      "fid_div_cls_code": "0",
+      "fid_aply_rang_prc_1": "",
+      "fid_vol_cnt": "",
+      "fid_pbmn": "",
+      "fid_blng_cls_code": "0",
+      "fid_mkop_cls_code": "0"
+    }
+  },
+  {
+    "name": "trade_power",
+    "enabled": false,
+    "path": "",
+    "tr_id": "",
+    "params": {}
+  }
+]
