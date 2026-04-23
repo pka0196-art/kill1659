@@ -1,978 +1,788 @@
-import io
-import math
 import os
 import re
 import time
+import json
 import zipfile
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
-from typing import Any
-from urllib.parse import quote
+from io import BytesIO
+from pathlib import Path
+from datetime import datetime, timedelta
+from collections import deque
 from xml.etree import ElementTree as ET
 
-import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import requests
 import streamlit as st
-import yfinance as yf
 
+# -------------------------------------------------
+# 0) Streamlit secrets -> environment bridge
+# -------------------------------------------------
+def _load_secrets_to_env():
+    try:
+        for key, value in st.secrets.items():
+            if isinstance(value, (str, int, float, bool)):
+                os.environ[str(key)] = str(value)
+    except Exception:
+        pass
 
-# --------------------------------------------------
-# 화면 설정
-# --------------------------------------------------
+_load_secrets_to_env()
+
+# -------------------------------------------------
+# 1) Optional imports from current project
+#    (Assumes you upload the whole kis_v8_suite repo)
+# -------------------------------------------------
+PROJECT_OK = True
+PROJECT_IMPORT_ERROR = ""
+
+try:
+    from app.source_manager import AutoSourceManager
+    from app.patterns import derive_pattern, derive_trade_levels, derive_grade
+    from app.public_info import PublicInfoManager
+    from app.scoring import build_snapshot, score_stock
+    from app.category_parser import parse_category_file, category_for
+    from app.utils import safe_int, safe_float
+    from app.config import settings as project_settings
+except Exception as e:
+    PROJECT_OK = False
+    PROJECT_IMPORT_ERROR = str(e)
+
+# -------------------------------------------------
+# 2) Basic config
+# -------------------------------------------------
 st.set_page_config(
-    page_title="키움 모의실시간 자동추천 TOP5",
-    page_icon="📈",
+    page_title="KIS Mobile Streamlit Dashboard",
     layout="wide",
+    page_icon="📈"
 )
 
-st.markdown(
-    """
-    <style>
-    .block-container {max-width: 1450px; padding-top: 1rem; padding-bottom: 2rem;}
-    .card {
-        padding: 1rem 1rem 0.85rem 1rem;
-        border: 1px solid rgba(128,128,128,0.18);
-        border-radius: 16px;
-        margin-bottom: 0.9rem;
-        min-height: 330px;
-    }
-    .rank-badge {
-        display: inline-block;
-        padding: 0.22rem 0.55rem;
-        border-radius: 999px;
-        border: 1px solid rgba(128,128,128,0.25);
-        font-size: 0.85rem;
-        font-weight: 700;
-        margin-bottom: 0.45rem;
-    }
-    .title-row {
-        font-size: 1.35rem;
-        font-weight: 800;
-        margin-bottom: 0.2rem;
-    }
-    .subtle {
-        color: #666;
-        font-size: 0.92rem;
-        margin-bottom: 0.45rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+APP_TITLE = os.getenv("APP_TITLE", "KIS Mobile Streamlit Dashboard")
+KIS_APP_KEY = os.getenv("KIS_APP_KEY", "").strip()
+KIS_APP_SECRET = os.getenv("KIS_APP_SECRET", "").strip()
+KIS_USE_MOCK = os.getenv("KIS_USE_MOCK", "false").lower() == "true"
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "").strip()
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "").strip()
+DART_API_KEY = os.getenv("DART_API_KEY", "").strip()
+WATCHLIST_CODES = os.getenv("WATCHLIST_CODES", "").strip()
+TOP_N_DEFAULT = int(os.getenv("TOP_N_DEFAULT", "15"))
 
-# --------------------------------------------------
-# 기본 종목 우주
-# --------------------------------------------------
-NAME_TO_CODE = {
-    "삼성전자": "005930",
-    "SK하이닉스": "000660",
-    "한미반도체": "042700",
-    "DB하이텍": "000990",
-    "리노공업": "058470",
-    "ISC": "095340",
-    "동진쎄미켐": "005290",
-    "제주반도체": "080220",
-    "네패스아크": "330860",
-    "원익IPS": "240810",
-    "이오테크닉스": "039030",
-    "휴림로봇": "090710",
-    "레인보우로보틱스": "277810",
-    "클로봇": "466100",
-    "두산로보틱스": "454910",
-    "에스피지": "058610",
-    "유일로보틱스": "388720",
-    "LIG넥스원": "079550",
-    "한국항공우주": "047810",
-    "한화에어로스페이스": "012450",
-    "현대로템": "064350",
-    "대한해운": "005880",
-    "팬오션": "028670",
-    "흥아해운": "003280",
-    "KSS해운": "044450",
-    "HMM": "011200",
-    "LS ELECTRIC": "010120",
-    "HD현대일렉트릭": "267260",
-    "효성중공업": "298040",
-    "두산에너빌리티": "034020",
-    "에코프로": "086520",
-    "에코프로비엠": "247540",
-    "포스코퓨처엠": "003670",
-    "금양": "001570",
-    "엘앤에프": "066970",
-    "리튬포어스": "073570",
-    "에코플라스틱": "038110",
-    "화신": "010690",
-    "성우하이텍": "015750",
-    "현대공업": "170030",
-    "삼성중공업": "010140",
-    "한화오션": "042660",
-    "HD한국조선해양": "009540",
-    "NAVER": "035420",
-    "카카오": "035720",
-    "더존비즈온": "012510",
-    "솔트룩스": "304100",
-    "넥스틸": "092790",
-    "세아제강": "306200",
-    "휴스틸": "005010",
-    "하이스틸": "071090",
-    "GS글로벌": "001250",
-    "우리기술": "032820",
-    "센서뷰": "321370",
-}
-CODE_TO_NAME = {v: k for k, v in NAME_TO_CODE.items()}
+BASE_URL = "https://openapivts.koreainvestment.com:29443" if KIS_USE_MOCK else "https://openapi.koreainvestment.com:9443"
 
-MARKET_UNIVERSE = list(NAME_TO_CODE.keys())
+st.title(APP_TITLE)
+st.caption("무료 Streamlit Community Cloud용 모바일 대시보드. 앱이 잠들 수 있지만, 컴퓨터가 꺼져 있어도 URL로 접속 가능합니다.")
 
-THEME_KEYWORDS = [
-    "AI", "인공지능", "반도체", "HBM", "로봇", "휴머노이드", "방산", "리튬", "희토류",
-    "전기차", "2차전지", "조선", "해운", "원전", "바이오", "제약", "데이터센터",
-    "전력", "우주", "스페이스", "유가", "천연가스", "구리", "철강", "건설", "통신",
-    "보안", "드론", "자동차", "플랫폼", "헬스케어"
-]
+# -------------------------------------------------
+# 3) Helpers
+# -------------------------------------------------
+TAG_RE = re.compile(r"<[^>]+>")
+NORMALIZE_RE = re.compile(r"[\s\-\_\[\]\(\)\.,'\"“”‘’:/|]+")
 
+def clean_text(text: str) -> str:
+    if text is None:
+        return ""
+    return TAG_RE.sub("", str(text)).strip()
 
-# --------------------------------------------------
-# 데이터 클래스
-# --------------------------------------------------
-@dataclass
-class KiwoomConfig:
-    appkey: str
-    secretkey: str
-    use_mock: bool = True
+def normalize_text(text: str) -> str:
+    return NORMALIZE_RE.sub("", clean_text(text)).lower()
 
-    @property
-    def base_url(self) -> str:
-        return "https://mockapi.kiwoom.com" if self.use_mock else "https://api.kiwoom.com"
+def dedupe_titles(items, limit=3):
+    out, seen = [], set()
+    for item in items:
+        nx = normalize_text(item)
+        if not nx or nx in seen:
+            continue
+        seen.add(nx)
+        out.append(clean_text(item))
+        if len(out) >= limit:
+            break
+    return out
 
+def fmt_num(v):
+    try:
+        return f"{int(float(v)):,}"
+    except Exception:
+        return "-"
 
-@dataclass
-class AnalysisResult:
-    name: str
-    code: str
-    ticker: str
-    market: str
-    current_price: float | None
-    price_note: str
-    price_asof: str
-    score: float
-    grade: str
-    setup: str
-    trend: str
-    entry_price: float | None
-    stop_price: float | None
-    target_price: float | None
-    summary: str
-    reasons: list[str]
-    news_items: list[dict]
-    disclosure_items: list[dict]
-    themes: list[str]
-    df: pd.DataFrame
+def fmt_pct(v):
+    try:
+        return f"{float(v):.2f}%"
+    except Exception:
+        return "-"
 
+def project_root():
+    return Path(".")
 
-# --------------------------------------------------
-# 키움 REST 클라이언트
-# --------------------------------------------------
-class KiwoomClient:
-    def __init__(self, config: KiwoomConfig):
-        self.config = config
-        self.token: str | None = None
+def tick_cls():
+    return __import__("app.models", fromlist=["TickSnapshot"]).TickSnapshot
 
-    def issue_token(self) -> dict[str, Any]:
-        url = f"{self.config.base_url}/oauth2/token"
+# -------------------------------------------------
+# 4) Minimal KIS REST client for Streamlit
+# -------------------------------------------------
+class KISMiniClient:
+    def __init__(self, app_key: str, app_secret: str, use_mock: bool = False):
+        self.app_key = app_key
+        self.app_secret = app_secret
+        self.base_url = "https://openapivts.koreainvestment.com:29443" if use_mock else "https://openapi.koreainvestment.com:9443"
+        self._token = None
+        self._token_exp = 0
+        self.session = requests.Session()
+
+    def access_token(self):
+        now = time.time()
+        if self._token and now < self._token_exp - 60:
+            return self._token
+
+        url = f"{self.base_url}/oauth2/tokenP"
         payload = {
             "grant_type": "client_credentials",
-            "appkey": self.config.appkey,
-            "secretkey": self.config.secretkey,
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
         }
-        resp = requests.post(url, json=payload, timeout=15)
+        resp = self.session.post(url, json=payload, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        self.token = data.get("token")
-        return data
+        self._token = data.get("access_token")
+        self._token_exp = now + int(data.get("expires_in", 86400))
+        return self._token
 
-    def _headers(self, api_id: str) -> dict[str, str]:
-        if not self.token:
-            self.issue_token()
-        return {
-            "authorization": f"Bearer {self.token}",
-            "api-id": api_id,
-            "cont-yn": "N",
-            "next-key": "",
-            "Content-Type": "application/json;charset=UTF-8",
+    def headers(self, tr_id: str = ""):
+        token = self.access_token()
+        headers = {
+            "authorization": f"Bearer {token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "custtype": "P",
         }
+        if tr_id:
+            headers["tr_id"] = tr_id
+        return headers
 
-    def post(self, path: str, api_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        url = f"{self.config.base_url}{path}"
-        resp = requests.post(url, headers=self._headers(api_id), json=body, timeout=15)
+    def get(self, path: str, params=None, tr_id: str = ""):
+        url = f"{self.base_url}{path}"
+        resp = self.session.get(url, params=params or {}, headers=self.headers(tr_id), timeout=15)
         resp.raise_for_status()
         return resp.json()
 
-    def get_quote(self, code: str) -> dict[str, Any]:
-        # 키움 공식 가이드의 주식호가요청 ka10004 사용
-        return self.post("/api/dostk/mrkcond", "ka10004", {"stk_cd": code})
+    def current_price(self, code: str):
+        params = {
+            "fid_cond_mrkt_div_code": "J",
+            "fid_input_iscd": code,
+        }
+        data = self.get("/uapi/domestic-stock/v1/quotations/inquire-price", params=params, tr_id="FHKST01010100")
+        out = data.get("output", {}) or {}
+        return {
+            "code": code,
+            "price": safe_int(out.get("stck_prpr")),
+            "change_rate": safe_float(out.get("prdy_ctrt")),
+            "volume": safe_int(out.get("acml_vol")),
+            "trade_value": safe_int(out.get("acml_tr_pbmn")),
+            "open_price": safe_int(out.get("stck_oprc")),
+            "high_price": safe_int(out.get("stck_hgpr")),
+            "low_price": safe_int(out.get("stck_lwpr")),
+            "name": out.get("hts_kor_isnm") or code,
+            "raw": out,
+        }
 
+    def daily_chart(self, code: str, days: int = 120):
+        end = datetime.now()
+        start = end - timedelta(days=max(days * 3, 180))
+        params = {
+            "fid_cond_mrkt_div_code": "J",
+            "fid_input_iscd": code,
+            "fid_input_date_1": start.strftime("%Y%m%d"),
+            "fid_input_date_2": end.strftime("%Y%m%d"),
+            "fid_period_div_code": "D",
+            "fid_org_adj_prc": "0",
+        }
+        data = self.get("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice", params=params, tr_id="FHKST03010100")
+        items = data.get("output2", []) or data.get("output1", []) or []
+        rows = []
+        for item in items:
+            dt = item.get("stck_bsop_date") or item.get("date")
+            close = safe_int(item.get("stck_clpr") or item.get("close"))
+            open_ = safe_int(item.get("stck_oprc") or item.get("open"))
+            high = safe_int(item.get("stck_hgpr") or item.get("high"))
+            low = safe_int(item.get("stck_lwpr") or item.get("low"))
+            vol = safe_int(item.get("acml_vol") or item.get("volume"))
+            if dt and close > 0:
+                rows.append({
+                    "date": pd.to_datetime(dt),
+                    "open": open_,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": vol,
+                })
+        if not rows:
+            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+        df = pd.DataFrame(rows).sort_values("date").drop_duplicates("date")
+        return df.tail(days)
 
-# --------------------------------------------------
-# 유틸
-# --------------------------------------------------
-def resolve_stock_input(text: str) -> tuple[str, str, str, str]:
-    raw = (text or "").strip()
-    if not raw:
-        return "", "", "", ""
-    if raw.isdigit() and len(raw) == 6:
-        code = raw
-        name = CODE_TO_NAME.get(code, code)
-    else:
-        normalized = re.sub(r"\s+", "", raw).upper()
-        code = ""
-        name = raw
-        for nm, cd in NAME_TO_CODE.items():
-            if re.sub(r"\s+", "", nm).upper() == normalized:
-                name = nm
-                code = cd
-                break
-        if not code and raw.upper().endswith((".KS", ".KQ")) and len(raw.split(".")[0]) == 6:
-            code = raw.split(".")[0]
-            name = CODE_TO_NAME.get(code, code)
-    if not code:
-        return name, "", "", ""
-    market = "KOSPI" if code.startswith(("0", "1", "2", "3")) else "KOSDAQ"
-    ticker = f"{code}.KS" if market == "KOSPI" else f"{code}.KQ"
-    return name, code, ticker, market
+@st.cache_resource(show_spinner=False)
+def get_kis_client():
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        raise RuntimeError("KIS_APP_KEY / KIS_APP_SECRET 이 설정되지 않았습니다.")
+    return KISMiniClient(KIS_APP_KEY, KIS_APP_SECRET, use_mock=KIS_USE_MOCK)
 
-
-def safe_float(value, digits: int = 2):
-    try:
-        if value is None or (isinstance(value, float) and math.isnan(value)):
-            return None
-        return round(float(value), digits)
-    except Exception:
-        return None
-
-
-def format_price(value):
-    if value is None or (isinstance(value, float) and np.isnan(value)):
-        return "-"
-    return f"{float(value):,.0f}"
-
-
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).fillna(50)
-
-
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high_low = df["High"] - df["Low"]
-    high_close = (df["High"] - df["Close"].shift(1)).abs()
-    low_close = (df["Low"] - df["Close"].shift(1)).abs()
-    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return true_range.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-
-
-def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["SMA5"] = out["Close"].rolling(5).mean()
-    out["SMA20"] = out["Close"].rolling(20).mean()
-    out["SMA60"] = out["Close"].rolling(60).mean()
-    out["EMA12"] = out["Close"].ewm(span=12, adjust=False).mean()
-    out["EMA26"] = out["Close"].ewm(span=26, adjust=False).mean()
-    out["MACD"] = out["EMA12"] - out["EMA26"]
-    out["MACD_SIGNAL"] = out["MACD"].ewm(span=9, adjust=False).mean()
-    out["RSI14"] = compute_rsi(out["Close"], 14)
-    out["ATR14"] = compute_atr(out, 14)
-    out["VOL_MA20"] = out["Volume"].rolling(20).mean()
-    out["VOL_RATIO"] = out["Volume"] / out["VOL_MA20"].replace(0, np.nan)
-    out["HIGH20"] = out["High"].rolling(20).max()
-    out["LOW20"] = out["Low"].rolling(20).min()
-    out["HIGH60"] = out["High"].rolling(60).max()
-    return out
-
-
-def compute_grade(score: float) -> str:
-    if score >= 85:
-        return "A"
-    if score >= 70:
-        return "B"
-    if score >= 55:
-        return "C"
-    return "D"
-
-
-def decide_setup(row: pd.Series) -> tuple[str, str]:
-    close = row["Close"]
-    sma20 = row["SMA20"]
-    sma60 = row["SMA60"]
-    high20 = row["HIGH20"]
-    vol_ratio = row["VOL_RATIO"]
-    rsi = row["RSI14"]
-    macd = row["MACD"]
-    macd_signal = row["MACD_SIGNAL"]
-    atr = row["ATR14"]
-
-    vals = [sma20, sma60, high20, vol_ratio, rsi, macd, macd_signal, atr]
-    if any(pd.isna(x) for x in vals):
-        return "데이터부족", "지표 계산에 필요한 데이터가 충분하지 않습니다."
-
-    near_breakout = close >= high20 * 0.985
-    volume_ok = vol_ratio >= 1.4
-    trend_ok = close > sma20 > sma60
-    momentum_ok = macd > macd_signal and rsi >= 52
-
-    if near_breakout and volume_ok and trend_ok and momentum_ok:
-        return "돌파형", "20일 고점권 접근 + 거래량 동반 + 추세 정배열"
-
-    pullback_zone = abs(close - sma20) <= atr * 0.9
-    pullback_rsi = 43 <= rsi <= 60
-    if trend_ok and pullback_zone and pullback_rsi:
-        return "눌림목형", "상승 추세 안에서 20일선 근처 눌림"
-
-    sideways = abs((row["HIGH20"] - row["LOW20"]) / close) <= 0.12
-    if sideways and close >= sma20 and vol_ratio >= 1.0:
-        return "박스상단대기", "변동성 압축 후 상단 돌파 대기"
-
-    if close < sma20 < sma60:
-        return "약세형", "이평선 역배열 구간"
-
-    return "관망형", "명확한 진입 패턴이 약합니다."
-
-
-def calculate_score(row: pd.Series, setup: str) -> tuple[float, list[str], str]:
-    score = 0.0
-    reasons = []
-
-    close = row["Close"]
-    sma20 = row["SMA20"]
-    sma60 = row["SMA60"]
-    rsi = row["RSI14"]
-    macd = row["MACD"]
-    macd_signal = row["MACD_SIGNAL"]
-    vol_ratio = row["VOL_RATIO"]
-    atr = row["ATR14"]
-    high20 = row["HIGH20"]
-
-    if close > sma20:
-        score += 15
-        reasons.append("현재가가 20일선 위")
-    if sma20 > sma60:
-        score += 15
-        reasons.append("20일선이 60일선 위")
-    if macd > macd_signal:
-        score += 12
-        reasons.append("MACD 방향 우세")
-    if 45 <= rsi <= 68:
-        score += 10
-        reasons.append("RSI 과열 아님")
-    elif rsi > 75:
-        score -= 6
-        reasons.append("RSI 과열 부담")
-    if vol_ratio >= 1.4:
-        score += 13
-        reasons.append("거래량 증가")
-    elif vol_ratio < 0.8:
-        score -= 4
-        reasons.append("거래량 약함")
-    if close >= high20 * 0.985:
-        score += 10
-        reasons.append("최근 20일 고점권 접근")
-
-    volatility_pct = (atr / close) * 100 if close else 0
-    if 2 <= volatility_pct <= 7:
-        score += 8
-        reasons.append("변동성 적정")
-    elif volatility_pct > 10:
-        score -= 5
-        reasons.append("변동성 과도")
-
-    setup_bonus = {
-        "돌파형": 20,
-        "눌림목형": 16,
-        "박스상단대기": 12,
-        "관망형": 3,
-        "데이터부족": -10,
-        "약세형": -15,
-    }.get(setup, 0)
-    score += setup_bonus
-    reasons.append(f"패턴 점수: {setup}")
-
-    score = max(0, min(100, score))
-    trend_text = "상승 우위" if close > sma20 > sma60 else "약세 또는 중립"
-    return round(score, 1), reasons, trend_text
-
-
-def calculate_technical_prices(row: pd.Series, setup: str, stop_pct: float = 0.07, reward_risk: float = 1.8) -> tuple[float | None, float | None, float | None]:
-    close = float(row["Close"])
-    sma5 = float(row["SMA5"]) if not pd.isna(row["SMA5"]) else close
-    sma20 = float(row["SMA20"]) if not pd.isna(row["SMA20"]) else close
-    high20 = float(row["HIGH20"]) if not pd.isna(row["HIGH20"]) else close
-    low20 = float(row["LOW20"]) if not pd.isna(row["LOW20"]) else None
-    atr = float(row["ATR14"]) if not pd.isna(row["ATR14"]) else close * 0.03
-
-    if setup == "돌파형":
-        entry = max(high20 * 1.003, close * 0.997)
-    elif setup == "눌림목형":
-        entry = min(close * 1.002, sma20 + atr * 0.2)
-    elif setup == "박스상단대기":
-        entry = high20 * 1.002
-    elif setup == "약세형":
-        entry = sma20 * 1.005
-    else:
-        entry = sma5
-
-    stop = entry * (1 - stop_pct)
-    if low20 and stop > low20:
-        stop = min(stop, low20 * 0.997)
-
-    risk = max(entry - stop, entry * 0.03)
-    target = entry + risk * reward_risk
-    return entry, stop, target
-
-
-def extract_kiwoom_current_price(quote_json: dict[str, Any]) -> str:
-    candidates = [
-        "cur_prc", "cur_price", "now_prc", "stck_prpr", "price", "close", "cur",
-        "sel_1th_pre_bid", "buy_1th_pre_bid"
-    ]
-    for key in candidates:
-        if key in quote_json and str(quote_json.get(key, "")).strip():
-            return str(quote_json.get(key))
-    if isinstance(quote_json.get("data"), dict):
-        data = quote_json["data"]
-        for key in candidates:
-            if key in data and str(data.get(key, "")).strip():
-                return str(data.get(key))
-    return "-"
-
-
-def get_current_price_kiwoom_or_yf(client: KiwoomClient | None, code: str, ticker: str, fallback_close: float) -> tuple[float, str, str]:
-    if client:
+# -------------------------------------------------
+# 5) Universe / category map
+# -------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_category_map():
+    if PROJECT_OK:
         try:
-            q = client.get_quote(code)
-            text = extract_kiwoom_current_price(q)
-            num = int(str(text).replace(",", "").replace("+", "").replace("-", ""))
-            if num > 0:
-                return float(num), "kiwoom_quote", "키움 모의실시간 현재가 기준"
+            return parse_category_file(project_settings.market_all_file)
+        except Exception:
+            return {}
+    return {}
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_watchlist_file():
+    codes = []
+    p = Path("watchlist.txt")
+    if p.exists():
+        for line in p.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            code = parts[0]
+            if len(code) == 6 and code.isdigit():
+                codes.append((code, " ".join(parts[1:]) if len(parts) > 1 else code))
+    return codes
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_universe_from_dart():
+    if not DART_API_KEY:
+        return {}
+    try:
+        url = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={DART_API_KEY}"
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        zf = zipfile.ZipFile(BytesIO(resp.content))
+        xml_name = zf.namelist()[0]
+        root = ET.fromstring(zf.read(xml_name))
+        data = {}
+        for elem in root.findall(".//list"):
+            stock_code = (elem.findtext("stock_code") or "").strip()
+            corp_name = (elem.findtext("corp_name") or "").strip()
+            if stock_code and corp_name:
+                data[stock_code] = corp_name
+        return data
+    except Exception:
+        return {}
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def build_universe():
+    universe = {}
+    for code, name in load_watchlist_file():
+        universe[code] = name
+
+    p = Path("market_all.txt")
+    if p.exists():
+        for line in p.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            code = parts[0]
+            if len(code) == 6 and code.isdigit():
+                universe[code] = " ".join(parts[1:]) if len(parts) > 1 else code
+
+    dart_map = load_universe_from_dart()
+    for code, name in dart_map.items():
+        universe.setdefault(code, name)
+
+    return universe
+
+def resolve_query_to_code(query: str):
+    q = (query or "").strip()
+    if not q:
+        return None, None
+    universe = build_universe()
+
+    if len(q) == 6 and q.isdigit():
+        return q, universe.get(q, q)
+
+    qn = q.lower().replace(" ", "")
+    exact, partial = [], []
+    for code, name in universe.items():
+        nn = str(name).lower().replace(" ", "")
+        if qn == nn:
+            exact.append((code, name))
+        elif qn in nn:
+            partial.append((code, name))
+    if exact:
+        return exact[0]
+    if partial:
+        return partial[0]
+    return None, None
+
+# -------------------------------------------------
+# 6) News / disclosure
+# -------------------------------------------------
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_news_titles(name: str):
+    if NAVER_CLIENT_ID and NAVER_CLIENT_SECRET:
+        try:
+            q = requests.utils.quote(f"{name} 주식")
+            url = f"https://openapi.naver.com/v1/search/news.json?query={q}&display=10&sort=date"
+            headers = {
+                "X-Naver-Client-Id": NAVER_CLIENT_ID,
+                "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+            }
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            titles = [clean_text(x.get("title", "")) for x in data.get("items", []) if x.get("title")]
+            titles = dedupe_titles(titles, limit=3)
+            if titles:
+                return titles
         except Exception:
             pass
 
     try:
-        intraday = yf.download(
-            ticker,
-            period="1d",
-            interval="1m",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-        if intraday is not None and not intraday.empty:
-            if isinstance(intraday.columns, pd.MultiIndex):
-                intraday.columns = intraday.columns.get_level_values(0)
-            intraday = intraday.dropna(subset=["Close"])
-            if not intraday.empty:
-                return float(intraday["Close"].iloc[-1]), str(intraday.index[-1]), "1분봉 최근가 기준"
-    except Exception:
-        pass
-
-    return float(fallback_close), "daily_close", "일봉 종가 기준"
-
-
-def fetch_google_news(query: str, days: int = 14, max_items: int = 5) -> list[dict]:
-    if not query:
-        return []
-    rss_url = f"https://news.google.com/rss/search?q={quote(query)}&hl=ko&gl=KR&ceid=KR:ko"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-
-    try:
-        resp = requests.get(rss_url, timeout=12, headers=headers)
+        q = requests.utils.quote(f"{name} 주식")
+        url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         root = ET.fromstring(resp.text)
+        titles = [clean_text(item.findtext("title", "")) for item in root.findall(".//item")[:10]]
+        titles = dedupe_titles(titles, limit=3)
+        return titles or ["최근 뉴스 없음"]
     except Exception:
-        return []
+        return ["최근 뉴스 없음"]
 
-    items = []
-    seen = set()
-    for item in root.findall(".//item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        pub_date_raw = (item.findtext("pubDate") or "").strip()
-        source_el = item.find("source")
-        source = source_el.text.strip() if source_el is not None and source_el.text else "출처미상"
-
-        if not title or title in seen:
-            continue
-
-        published = None
-        if pub_date_raw:
-            try:
-                published = parsedate_to_datetime(pub_date_raw)
-                if published.tzinfo is None:
-                    published = published.replace(tzinfo=timezone.utc)
-            except Exception:
-                published = None
-
-        if published and published < cutoff:
-            continue
-
-        seen.add(title)
-        items.append({
-            "title": title,
-            "link": link,
-            "source": source,
-            "published": published.astimezone(timezone.utc).strftime("%Y-%m-%d") if published else "-",
-        })
-        if len(items) >= max_items:
-            break
-    return items
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_dart_corp_codes(dart_key: str) -> pd.DataFrame:
-    if not dart_key:
-        return pd.DataFrame(columns=["corp_code", "corp_name", "stock_code"])
-    url = "https://opendart.fss.or.kr/api/corpCode.xml"
-    resp = requests.get(url, params={"crtfc_key": dart_key}, timeout=20)
-    resp.raise_for_status()
-
-    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-        name = zf.namelist()[0]
-        xml_bytes = zf.read(name)
-
-    root = ET.fromstring(xml_bytes)
-    rows = []
-    for item in root.findall(".//list"):
-        rows.append({
-            "corp_code": (item.findtext("corp_code") or "").strip(),
-            "corp_name": (item.findtext("corp_name") or "").strip(),
-            "stock_code": (item.findtext("stock_code") or "").strip(),
-        })
-    return pd.DataFrame(rows)
-
-
-def find_dart_corp_code(dart_key: str, name: str, code: str) -> str | None:
-    if not dart_key:
-        return None
-    df = load_dart_corp_codes(dart_key)
-    if df.empty:
-        return None
-    hit = df[df["stock_code"] == code]
-    if not hit.empty:
-        return str(hit.iloc[0]["corp_code"])
-    hit = df[df["corp_name"] == name]
-    if not hit.empty:
-        return str(hit.iloc[0]["corp_code"])
-    return None
-
-
-def fetch_dart_disclosures(dart_key: str, corp_code: str | None, days: int = 30, max_items: int = 5) -> list[dict]:
-    if not dart_key or not corp_code:
-        return []
-
-    end_de = datetime.now().strftime("%Y%m%d")
-    bgn_de = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-    url = "https://opendart.fss.or.kr/api/list.json"
-    params = {
-        "crtfc_key": dart_key,
-        "corp_code": corp_code,
-        "bgn_de": bgn_de,
-        "end_de": end_de,
-        "last_reprt_at": "Y",
-        "page_no": 1,
-        "page_count": max_items,
-    }
-
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_dart_corp_map():
+    if not DART_API_KEY:
+        return {}
     try:
-        resp = requests.get(url, params=params, timeout=20)
+        url = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={DART_API_KEY}"
+        resp = requests.get(url, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
+        zf = zipfile.ZipFile(BytesIO(resp.content))
+        xml_name = zf.namelist()[0]
+        root = ET.fromstring(zf.read(xml_name))
+        result = {}
+        for elem in root.findall(".//list"):
+            stock_code = (elem.findtext("stock_code") or "").strip()
+            corp_code = (elem.findtext("corp_code") or "").strip()
+            if stock_code and corp_code:
+                result[stock_code] = corp_code
+        return result
     except Exception:
-        return []
-
-    items = []
-    for item in data.get("list", [])[:max_items]:
-        rcept_no = str(item.get("rcept_no", "")).strip()
-        viewer = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}" if rcept_no else ""
-        items.append({
-            "title": item.get("report_nm", ""),
-            "date": item.get("rcept_dt", ""),
-            "corp_name": item.get("corp_name", ""),
-            "link": viewer,
-        })
-    return items
-
-
-def detect_themes(titles: list[str]) -> list[str]:
-    joined = " ".join(titles)
-    out = []
-    for kw in THEME_KEYWORDS:
-        if kw.lower() in joined.lower() and kw not in out:
-            out.append(kw)
-    return out[:6]
-
-
-def build_chart(df: pd.DataFrame, name: str) -> go.Figure:
-    last_df = df.tail(90).copy()
-    fig = go.Figure()
-    fig.add_trace(
-        go.Candlestick(
-            x=last_df.index,
-            open=last_df["Open"],
-            high=last_df["High"],
-            low=last_df["Low"],
-            close=last_df["Close"],
-            name="캔들",
-        )
-    )
-    fig.add_trace(go.Scatter(x=last_df.index, y=last_df["SMA20"], mode="lines", name="SMA20"))
-    fig.add_trace(go.Scatter(x=last_df.index, y=last_df["SMA60"], mode="lines", name="SMA60"))
-    fig.update_layout(
-        title=f"{name} 최근 90거래일 차트",
-        xaxis_rangeslider_visible=False,
-        height=480,
-        margin=dict(l=10, r=10, t=45, b=10),
-        legend=dict(orientation="h"),
-    )
-    return fig
-
-
-def analyze_one(
-    stock_input: str,
-    client: KiwoomClient | None,
-    dart_key: str,
-    period: str,
-    stop_pct: float,
-    reward_risk: float,
-    news_days: int,
-    disc_days: int,
-) -> AnalysisResult | None:
-    name, code, ticker, market = resolve_stock_input(stock_input)
-    if not ticker:
-        return None
-
-    df = yf.download(
-        ticker,
-        period=period,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
-    if df is None or df.empty:
-        return None
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
-    df = enrich_indicators(df)
-    last = df.iloc[-1]
-
-    current_price, price_asof, price_note = get_current_price_kiwoom_or_yf(client, code, ticker, float(last["Close"]))
-
-    calc_row = last.copy()
-    calc_row["Close"] = current_price
-
-    setup, setup_desc = decide_setup(calc_row)
-    score, reasons, trend = calculate_score(calc_row, setup)
-    grade = compute_grade(score)
-    entry, stop, target = calculate_technical_prices(calc_row, setup, stop_pct=stop_pct, reward_risk=reward_risk)
-
-    news_items = fetch_google_news(name, days=news_days, max_items=5)
-    corp_code = find_dart_corp_code(dart_key, name, code)
-    disclosure_items = fetch_dart_disclosures(dart_key, corp_code, days=disc_days, max_items=5)
-    themes = detect_themes([x["title"] for x in news_items])
-
-    explain = [setup_desc] + reasons
-    explain.append("기술적 매수가는 현재가가 아니라 패턴/이평/고점구조 기준으로 계산")
-    explain.append(f"현재가 반영 기준: {price_note}")
-    if themes:
-        explain.append("감지 테마: " + ", ".join(themes))
-    if disclosure_items:
-        explain.append(f"최근 {disc_days}일 공시 {len(disclosure_items)}건 확인")
-
-    summary = (
-        f"{name}은(는) 현재 **{setup}** 성격이 가장 강합니다. "
-        f"점수는 **{score}점({grade})**, 추세 평가는 **{trend}** 입니다."
-    )
-
-    return AnalysisResult(
-        name=name,
-        code=code,
-        ticker=ticker,
-        market=market,
-        current_price=safe_float(current_price, 2),
-        price_note=price_note,
-        price_asof=str(price_asof),
-        score=score,
-        grade=grade,
-        setup=setup,
-        trend=trend,
-        entry_price=safe_float(entry, 2),
-        stop_price=safe_float(stop, 2),
-        target_price=safe_float(target, 2),
-        summary=summary,
-        reasons=explain,
-        news_items=news_items,
-        disclosure_items=disclosure_items,
-        themes=themes,
-        df=df,
-    )
-
+        return {}
 
 @st.cache_data(ttl=900, show_spinner=False)
-def auto_recommend_top5(
-    universe: tuple[str, ...],
-    appkey: str,
-    secretkey: str,
-    use_mock: bool,
-    dart_key: str,
-    period: str,
-    stop_pct: float,
-    reward_risk: float,
-    news_days: int,
-    disc_days: int,
-) -> list[AnalysisResult]:
-    client = None
-    if appkey and secretkey:
-        try:
-            client = KiwoomClient(KiwoomConfig(appkey=appkey, secretkey=secretkey, use_mock=use_mock))
-        except Exception:
-            client = None
+def fetch_disclosures(stock_code: str, name: str):
+    if DART_API_KEY:
+        corp_map = load_dart_corp_map()
+        corp_code = corp_map.get(stock_code)
+        if corp_code:
+            try:
+                end_de = datetime.now().strftime("%Y%m%d")
+                bgn_de = (datetime.now() - timedelta(days=14)).strftime("%Y%m%d")
+                url = "https://opendart.fss.or.kr/api/list.json"
+                params = {
+                    "crtfc_key": DART_API_KEY,
+                    "corp_code": corp_code,
+                    "bgn_de": bgn_de,
+                    "end_de": end_de,
+                    "page_no": "1",
+                    "page_count": "10",
+                }
+                resp = requests.get(url, params=params, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                titles = [x.get("report_nm", "").strip() for x in data.get("list", []) if x.get("report_nm")]
+                titles = dedupe_titles(titles, limit=3)
+                if titles:
+                    return titles
+            except Exception:
+                pass
+    return ["최근 공시 없음"]
 
-    results = []
-    for item in universe:
-        try:
-            result = analyze_one(
-                item,
-                client=client,
-                dart_key=dart_key,
-                period=period,
-                stop_pct=stop_pct,
-                reward_risk=reward_risk,
-                news_days=news_days,
-                disc_days=disc_days,
-            )
-            if result is None:
-                continue
-            if result.score < 48:
-                continue
-            if result.setup == "약세형":
-                continue
-            results.append(result)
-        except Exception:
-            continue
-        time.sleep(0.02)
-
-    results.sort(key=lambda x: x.score, reverse=True)
-    return results[:5]
-
-
-# --------------------------------------------------
-# 화면
-# --------------------------------------------------
-st.title("📈 키움 모의실시간 자동추천 TOP5 + 종목 검색")
-st.caption("키움 모의투자 실시간 현재가를 우선 사용하고, 추천주는 5개만 뽑아 보여주는 버전입니다.")
-
-with st.expander("사용 전 꼭 읽어주세요", expanded=True):
-    st.markdown(
-        """
-        - 키움 App Key / Secret Key를 넣으면 **키움 모의투자 시세**를 우선 사용합니다.
-        - 추천주는 **TOP5만 표시**합니다.
-        - 기술적 매수가는 현재가가 아니라 **차트 패턴/이평/고점 구조 기반**으로 계산합니다.
-        - 공시까지 보려면 Open DART API Key가 필요합니다.
-        """
+# -------------------------------------------------
+# 7) Analysis engine
+# -------------------------------------------------
+def build_snap_for_score(cp: dict):
+    return tick_cls()(
+        ts=time.time(),
+        price=safe_int(cp.get("price")),
+        open_price=safe_int(cp.get("open_price")),
+        high_price=safe_int(cp.get("high_price")),
+        low_price=safe_int(cp.get("low_price")),
+        volume=safe_int(cp.get("volume")),
+        trade_value=safe_int(cp.get("trade_value")),
+        change_rate=safe_float(cp.get("change_rate")),
     )
 
-with st.sidebar:
-    st.header("키움 설정")
-    appkey = st.text_input("키움 App Key", value=os.getenv("KIWOOM_APPKEY", ""))
-    secretkey = st.text_input("키움 Secret Key", value=os.getenv("KIWOOM_SECRETKEY", ""), type="password")
-    use_mock = st.checkbox("키움 모의투자 사용", value=True)
-    dart_key = st.text_input("Open DART API Key (공시용, 선택)", value=os.getenv("DART_API_KEY", ""))
-    st.caption("모의투자 도메인은 KRX만 지원됩니다.")
+def build_hist_from_daily(df: pd.DataFrame):
+    hist = deque(maxlen=getattr(project_settings, "history_size", 20) if PROJECT_OK else 20)
+    if df is None or df.empty:
+        return hist
+    tail = df.tail(20)
+    for _, row in tail.iterrows():
+        trade_value = safe_int(row["close"]) * safe_int(row["volume"])
+        hist.append(tick_cls()(
+            ts=float(pd.Timestamp(row["date"]).timestamp()),
+            price=safe_int(row["close"]),
+            open_price=safe_int(row["open"]),
+            high_price=safe_int(row["high"]),
+            low_price=safe_int(row["low"]),
+            volume=safe_int(row["volume"]),
+            trade_value=trade_value,
+            change_rate=0.0,
+        ))
+    return hist
 
-tab_auto, tab_search = st.tabs(["자동 추천 TOP5", "종목 검색"])
+def fallback_analysis(cp: dict, df: pd.DataFrame, code: str, name: str):
+    category = category_for(code, load_category_map(), "관심종목") if PROJECT_OK else "관심종목"
+    price = safe_int(cp.get("price"))
+    high = safe_int(cp.get("high_price"))
+    low = safe_int(cp.get("low_price"))
+    change_rate = safe_float(cp.get("change_rate"))
+    near_high = (price / high * 100.0) if high > 0 else 0.0
 
-with tab_auto:
-    st.subheader("자동 추천 TOP5")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        period = st.selectbox("분석 기간", ["6mo", "1y", "2y"], index=1, key="auto_period")
-    with c2:
-        stop_label = st.selectbox("손절 비율", ["5%", "7%", "10%"], index=1, key="auto_stop")
-    with c3:
-        rr = st.selectbox("손익비", [1.5, 1.8, 2.0], index=1, key="auto_rr")
-    with c4:
-        news_days = st.selectbox("뉴스 기간", [7, 14, 30], index=1, key="auto_news_days")
+    vol_ratio = 1.0
+    if df is not None and not df.empty and "volume" in df:
+        avg_vol = float(df["volume"].tail(20).mean() or 0)
+        if avg_vol > 0:
+            vol_ratio = safe_int(cp.get("volume")) / avg_vol
 
-    disc_days = st.selectbox("공시 기간(일)", [7, 14, 30, 60], index=2, key="auto_disc_days")
-    run_auto = st.button("자동 추천 TOP5 실행", use_container_width=True)
+    if change_rate >= 8 and near_high >= 98:
+        pattern = "시가 돌파형"
+        score = 46
+    elif change_rate >= 3 and near_high >= 96:
+        pattern = "상단 박스 유지형"
+        score = 36
+    else:
+        pattern = "관찰형"
+        score = 18
 
-    if run_auto:
-        stop_pct = {"5%": 0.05, "7%": 0.07, "10%": 0.10}[stop_label]
-        with st.spinner("자동 추천 TOP5 계산 중입니다..."):
-            results = auto_recommend_top5(
-                tuple(MARKET_UNIVERSE),
-                appkey=appkey,
-                secretkey=secretkey,
-                use_mock=use_mock,
-                dart_key=dart_key,
-                period=period,
-                stop_pct=stop_pct,
-                reward_risk=float(rr),
-                news_days=int(news_days),
-                disc_days=int(disc_days),
-            )
+    grade = "A" if score >= 45 else "B" if score >= 35 else "C" if score >= 25 else "D"
+    buy = int(price * 0.995) if pattern != "관찰형" else price
+    stop = max(1, int(low * 0.995)) if low > 0 else int(price * 0.985)
+    target1 = int(price * 1.015)
+    target2 = int(price * 1.03)
+    reasons = [f"등락률 {change_rate:.2f}%", f"고가근접 {near_high:.2f}%", f"거래량배수 {vol_ratio:.2f}배"]
 
-        if not results:
-            st.warning("현재 조건에 맞는 추천 종목이 없습니다.")
-        else:
-            st.markdown("### 오늘 장전 자동 추천 TOP5")
-            cols = st.columns(5)
-            for idx, (col, r) in enumerate(zip(cols, results), start=1):
-                with col:
-                    st.markdown('<div class="card">', unsafe_allow_html=True)
-                    st.markdown(f'<div class="rank-badge">TOP {idx}</div>', unsafe_allow_html=True)
-                    st.markdown(f'<div class="title-row">{r.name}</div>', unsafe_allow_html=True)
-                    st.markdown(f'<div class="subtle">{r.market} | 점수 {r.score} / 100 | 등급 {r.grade} | 패턴 {r.setup}</div>', unsafe_allow_html=True)
-                    st.write(f"**현재가:** {format_price(r.current_price)}")
-                    st.write(f"**기술적 매수가:** {format_price(r.entry_price)}")
-                    st.write(f"**손절가:** {format_price(r.stop_price)}")
-                    st.write(f"**목표가:** {format_price(r.target_price)}")
-                    st.write("**추천 이유**")
-                    for reason in r.reasons[:4]:
-                        st.write(f"- {reason}")
-                    if r.news_items:
-                        st.write(f"**대표 뉴스:** {r.news_items[0]['title']}")
-                    st.markdown('</div>', unsafe_allow_html=True)
+    if score >= 45 and (price - buy) / buy * 100 <= 1.2:
+        judgement = "매수 가능"
+        judgement_note = "강한 추세와 고가권 유지가 확인됩니다."
+    elif score >= 30:
+        judgement = "눌림 대기"
+        judgement_note = "관심 가능하지만 추천매수가 근처 눌림 확인이 유리합니다."
+    else:
+        judgement = "관망"
+        judgement_note = "강도가 약합니다. 추가 확인이 필요합니다."
 
-            st.markdown("### 추천 순위표")
-            rank_df = pd.DataFrame([
-                {
-                    "순위": i + 1,
-                    "종목명": r.name,
-                    "시장": r.market,
-                    "종목코드": r.code,
-                    "점수": r.score,
-                    "등급": r.grade,
-                    "패턴": r.setup,
-                    "현재가": format_price(r.current_price),
-                    "기술적 매수가": format_price(r.entry_price),
-                    "손절가": format_price(r.stop_price),
-                    "목표가": format_price(r.target_price),
-                    "추세": r.trend,
-                    "현재가 기준": r.price_note,
-                }
-                for i, r in enumerate(results)
-            ])
-            st.dataframe(rank_df, use_container_width=True, hide_index=True)
+    return {
+        "code": code,
+        "name": name,
+        "category": category,
+        "price": price,
+        "change_rate": change_rate,
+        "score": score,
+        "grade": grade,
+        "pattern": pattern,
+        "buy_price": buy,
+        "stop_price": stop,
+        "target1_price": target1,
+        "target2_price": target2,
+        "judgement": judgement,
+        "judgement_note": judgement_note,
+        "chart_note": "일봉 기준 단순 패턴 분석",
+        "reasons": reasons,
+        "near_high_pct": near_high,
+        "volume": safe_int(cp.get("volume")),
+        "trade_value": safe_int(cp.get("trade_value")),
+        "daily_df": df,
+    }
 
-with tab_search:
-    st.subheader("종목 검색")
-    s1, s2, s3, s4 = st.columns(4)
-    with s1:
-        stock_input = st.text_input("종목명 또는 코드", value="삼성전자")
-    with s2:
-        search_period = st.selectbox("분석 기간", ["6mo", "1y", "2y"], index=1, key="search_period")
-    with s3:
-        search_stop = st.selectbox("손절 비율", ["5%", "7%", "10%"], index=1, key="search_stop")
-    with s4:
-        search_rr = st.selectbox("손익비", [1.5, 1.8, 2.0], index=1, key="search_rr")
+@st.cache_data(ttl=120, show_spinner=False)
+def analyze_stock(code: str, name_hint: str = ""):
+    client = get_kis_client()
+    cp = client.current_price(code)
+    name = name_hint or cp.get("name") or code
+    df = client.daily_chart(code, days=120)
 
-    s5, s6 = st.columns(2)
-    with s5:
-        search_news_days = st.selectbox("뉴스 기간", [7, 14, 30], index=1, key="search_news_days")
-    with s6:
-        search_disc_days = st.selectbox("공시 기간(일)", [7, 14, 30, 60], index=2, key="search_disc_days")
+    if PROJECT_OK:
+        try:
+            hist = build_hist_from_daily(df)
+            hist.append(build_snap_for_score(cp))
+            score_info = score_stock(hist, project_settings)
+            metrics = score_info["metrics"]
+            category = category_for(code, load_category_map(), "관심종목")
+            snap = build_snap_for_score(cp)
+            pattern, chart_note = derive_pattern(metrics, snap)
+            levels = derive_trade_levels(snap, score_info, pattern)
+            grade = derive_grade(score_info["score"])
 
-    run_search = st.button("종목 분석 실행", use_container_width=True)
+            gap = ((cp["price"] - levels["buy"]) / levels["buy"] * 100.0) if levels["buy"] else 0.0
+            risk = ((levels["buy"] - levels["stop"]) / levels["buy"] * 100.0) if levels["buy"] else 0.0
+            if score_info["score"] >= 45 and gap <= 1.2:
+                judgement = "매수 가능"
+                judgement_note = f"점수 {score_info['score']}점으로 강한 편이며 추천매수가 근처입니다. 예상 손절폭 약 {risk:.2f}%."
+            elif score_info["score"] >= 35 and gap <= 3.0:
+                judgement = "눌림 대기"
+                judgement_note = "현재가가 추천매수가보다 다소 높아 눌림 확인 후 접근이 유리합니다."
+            elif score_info["score"] >= 25:
+                judgement = "관망"
+                judgement_note = "패턴은 있으나 강도가 중간 수준입니다. 추가 확인이 필요합니다."
+            else:
+                judgement = "비추천"
+                judgement_note = "점수와 패턴 강도가 낮아 보수적 접근이 유리합니다."
 
-    if run_search:
-        search_stop_pct = {"5%": 0.05, "7%": 0.07, "10%": 0.10}[search_stop]
-        client = None
-        if appkey and secretkey:
+            result = {
+                "code": code,
+                "name": name,
+                "category": category,
+                "price": cp["price"],
+                "change_rate": cp["change_rate"],
+                "score": score_info["score"],
+                "grade": grade,
+                "pattern": pattern,
+                "buy_price": levels["buy"],
+                "stop_price": levels["stop"],
+                "target1_price": levels["target1"],
+                "target2_price": levels["target2"],
+                "judgement": judgement,
+                "judgement_note": judgement_note,
+                "chart_note": chart_note,
+                "reasons": score_info["reasons"],
+                "near_high_pct": metrics.get("near_high_pct", 0.0),
+                "volume": cp["volume"],
+                "trade_value": cp["trade_value"],
+                "daily_df": df,
+            }
+        except Exception:
+            result = fallback_analysis(cp, df, code, name)
+    else:
+        result = fallback_analysis(cp, df, code, name)
+
+    result["news_titles"] = fetch_news_titles(name)
+    result["disclosures"] = fetch_disclosures(code, name)
+    return result
+
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch_auto_candidates(top_n: int = 15):
+    rows = []
+    used_sources = []
+    errors = []
+
+    if PROJECT_OK:
+        try:
+            from app.clients.rest_client import KISRestClient as ProjectKISRestClient
+            project_client = ProjectKISRestClient()
+            manager = AutoSourceManager()
+            ranking_codes, used_sources = manager.fetch_candidates(project_client)
+            if ranking_codes:
+                for code, name in list(ranking_codes.items())[: max(top_n, 20)]:
+                    try:
+                        rows.append(analyze_stock(code, name))
+                    except Exception as e:
+                        errors.append(f"{name}({code}) 분석 실패: {e}")
+            else:
+                errors.append("순위 소스 결과가 비어 있습니다.")
+        except Exception as e:
+            errors.append(f"프로젝트 순위 소스 사용 실패: {e}")
+    else:
+        errors.append(f"프로젝트 모듈 import 실패: {PROJECT_IMPORT_ERROR}")
+
+    # Fallback: watchlist only
+    if not rows:
+        wl = load_watchlist_file()
+        for code, name in wl[:top_n]:
             try:
-                client = KiwoomClient(KiwoomConfig(appkey=appkey, secretkey=secretkey, use_mock=use_mock))
-            except Exception:
-                client = None
+                rows.append(analyze_stock(code, name))
+            except Exception as e:
+                errors.append(f"Watchlist {name}({code}) 실패: {e}")
 
-        with st.spinner("종목 분석 중입니다..."):
-            result = analyze_one(
-                stock_input,
-                client=client,
-                dart_key=dart_key,
-                period=search_period,
-                stop_pct=search_stop_pct,
-                reward_risk=float(search_rr),
-                news_days=int(search_news_days),
-                disc_days=int(search_disc_days),
-            )
+    rows = sorted(rows, key=lambda x: (x.get("score", 0), x.get("change_rate", 0), x.get("trade_value", 0)), reverse=True)
+    for idx, row in enumerate(rows, start=1):
+        row["priority_rank"] = idx
+    return rows[:top_n], used_sources, errors
 
-        if result is None:
-            st.error("종목 데이터를 불러오지 못했습니다.")
+def rows_to_df(rows):
+    data = []
+    for r in rows:
+        data.append({
+            "순위": r.get("priority_rank", 0),
+            "카테고리": r.get("category", ""),
+            "코드": r.get("code", ""),
+            "종목명": r.get("name", ""),
+            "패턴": r.get("pattern", ""),
+            "등급": r.get("grade", ""),
+            "현재가": r.get("price", 0),
+            "등락률": r.get("change_rate", 0.0),
+            "점수": r.get("score", 0),
+            "추천매수가": r.get("buy_price", 0),
+            "손절가": r.get("stop_price", 0),
+            "1차목표가": r.get("target1_price", 0),
+            "2차목표가": r.get("target2_price", 0),
+            "거래량": r.get("volume", 0),
+            "거래대금": r.get("trade_value", 0),
+            "고가근접": round(float(r.get("near_high_pct", 0.0)), 2),
+        })
+    return pd.DataFrame(data)
+
+# -------------------------------------------------
+# 8) Sidebar
+# -------------------------------------------------
+with st.sidebar:
+    st.header("설정")
+    st.write(f"환경: {'모의' if KIS_USE_MOCK else '실전'}")
+    st.write(f"프로젝트 모듈 연결: {'정상' if PROJECT_OK else '실패'}")
+    top_n = st.slider("자동 추천 개수", min_value=5, max_value=30, value=TOP_N_DEFAULT, step=1)
+    refresh_btn = st.button("자동 추천 새로고침")
+    st.divider()
+    st.caption("Streamlit Cloud에서는 앱이 잠들 수 있습니다. 깨우면 다시 사용할 수 있습니다.")
+
+# -------------------------------------------------
+# 9) Tabs
+# -------------------------------------------------
+tab_auto, tab_search, tab_watch = st.tabs(["자동 추천", "개별 종목 분석", "관심종목"])
+
+# ---- Auto tab
+with tab_auto:
+    st.subheader("자동 추천")
+    st.caption("현재 프로젝트의 순위 소스를 우선 사용하고, 실패하면 watchlist로 fallback 합니다.")
+
+    if refresh_btn:
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
+
+    with st.spinner("자동 추천 종목을 조회하는 중입니다..."):
+        auto_rows, used_sources, auto_errors = fetch_auto_candidates(top_n=top_n)
+
+    if used_sources:
+        st.info("사용 소스: " + ", ".join(used_sources))
+    if auto_errors:
+        with st.expander("조회 경고 / 로그", expanded=False):
+            for err in auto_errors:
+                st.write("- " + err)
+
+    if auto_rows:
+        df = rows_to_df(auto_rows)
+        categories = ["전체"] + sorted(df["카테고리"].dropna().astype(str).unique().tolist())
+        selected_cat = st.selectbox("카테고리 필터", categories, index=0)
+        if selected_cat != "전체":
+            df = df[df["카테고리"] == selected_cat]
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 상위 종목 빠른 보기")
+        pick_options = {f"{r['name']} ({r['code']})": r for r in auto_rows}
+        picked_label = st.selectbox("상세 보기 종목", list(pick_options.keys()))
+        picked = pick_options[picked_label]
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("현재가", fmt_num(picked["price"]))
+        col2.metric("등락률", fmt_pct(picked["change_rate"]))
+        col3.metric("점수 / 등급", f"{picked['score']} / {picked['grade']}")
+        col4.metric("판단", picked["judgement"])
+
+        st.write(f"**패턴**: {picked['pattern']}")
+        st.write(f"**추천매수가 / 손절가 / 목표가**: {fmt_num(picked['buy_price'])} / {fmt_num(picked['stop_price'])} / {fmt_num(picked['target1_price'])}, {fmt_num(picked['target2_price'])}")
+        st.write(f"**차트 사유**: {picked['chart_note']}")
+        st.write(f"**점수 사유**: {', '.join(picked['reasons'])}")
+        st.write("**뉴스**")
+        for n in picked["news_titles"]:
+            st.write("- " + n)
+        st.write("**공시**")
+        for d in picked["disclosures"]:
+            st.write("- " + d)
+
+        ddf = picked.get("daily_df")
+        if isinstance(ddf, pd.DataFrame) and not ddf.empty:
+            st.line_chart(ddf.set_index("date")[["close"]])
+
+    else:
+        st.warning("자동 추천 결과가 없습니다.")
+
+# ---- Search tab
+with tab_search:
+    st.subheader("개별 종목 분석")
+    st.caption("종목명 또는 6자리 종목코드를 입력하세요. DART 키가 있으면 종목명 검색이 더 잘 됩니다.")
+
+    search_query = st.text_input("종목명 / 종목코드", placeholder="예: 삼성전자 또는 005930")
+    analyze_clicked = st.button("종목 분석 실행", key="analyze_btn")
+
+    if analyze_clicked:
+        code, name = resolve_query_to_code(search_query)
+        if not code:
+            st.error("종목을 찾지 못했습니다. 종목코드 6자리 입력을 권장합니다.")
         else:
-            top_a, top_b, top_c, top_d = st.columns(4)
-            top_a.metric("종목명", result.name)
-            top_b.metric("현재가", format_price(result.current_price))
-            top_c.metric("점수", f"{result.score} / 100")
-            top_d.metric("등급", result.grade)
-            st.caption(f"현재가 반영 기준: {result.price_note} | 기준시각: {result.price_asof}")
+            with st.spinner(f"{name}({code}) 분석 중..."):
+                try:
+                    result = analyze_stock(code, name)
+                    st.success("분석 완료")
 
-            st.markdown("### 분석 요약")
-            st.markdown(result.summary)
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("종목", f"{result['name']} ({result['code']})")
+                    c2.metric("카테고리", result["category"])
+                    c3.metric("패턴 / 등급", f"{result['pattern']} / {result['grade']}")
+                    c4.metric("판단", result["judgement"])
 
-            l1, l2, l3, l4 = st.columns(4)
-            l1.metric("기술적 매수가", format_price(result.entry_price))
-            l2.metric("손절가", format_price(result.stop_price))
-            l3.metric("목표가", format_price(result.target_price))
-            l4.metric("패턴", result.setup)
+                    c5, c6, c7, c8 = st.columns(4)
+                    c5.metric("현재가", fmt_num(result["price"]))
+                    c6.metric("등락률 / 점수", f"{fmt_pct(result['change_rate'])} / {result['score']}")
+                    c7.metric("추천매수가", fmt_num(result["buy_price"]))
+                    c8.metric("손절가", fmt_num(result["stop_price"]))
 
-            left, right = st.columns([1.1, 1.0])
-            with left:
-                st.plotly_chart(build_chart(result.df, result.name), use_container_width=True)
-                st.markdown("### 추천 근거")
-                for reason in result.reasons:
-                    st.write(f"- {reason}")
+                    c9, c10, c11, c12 = st.columns(4)
+                    c9.metric("1차 목표가", fmt_num(result["target1_price"]))
+                    c10.metric("2차 목표가", fmt_num(result["target2_price"]))
+                    c11.metric("고가근접", fmt_pct(result["near_high_pct"]))
+                    c12.metric("거래량 / 거래대금", f"{fmt_num(result['volume'])} / {fmt_num(result['trade_value'])}")
 
-            with right:
-                st.markdown("### 추천 뉴스")
-                if result.news_items:
-                    for item in result.news_items:
-                        if item["link"]:
-                            st.markdown(f"- [{item['title']}]({item['link']})")
-                        else:
-                            st.write(f"- {item['title']}")
-                        st.caption(f"{item['source']} | {item['published']}")
-                else:
-                    st.write("최근 추천 뉴스가 없습니다.")
+                    st.write(f"**판단 메모**: {result['judgement_note']}")
+                    st.write(f"**차트/패턴 사유**: {result['chart_note']}")
+                    st.write(f"**점수 사유**: {', '.join(result['reasons'])}")
 
-                st.markdown("### 최근 공시")
-                if result.disclosure_items:
-                    for item in result.disclosure_items:
-                        if item["link"]:
-                            st.markdown(f"- [{item['title']}]({item['link']})")
-                        else:
-                            st.write(f"- {item['title']}")
-                        st.caption(item["date"])
-                else:
-                    if dart_key:
-                        st.write("최근 공시가 없거나 조회되지 않았습니다.")
-                    else:
-                        st.write("Open DART API Key를 입력하면 공시를 함께 볼 수 있습니다.")
+                    ddf = result.get("daily_df")
+                    if isinstance(ddf, pd.DataFrame) and not ddf.empty:
+                        st.markdown("#### 최근 일봉 차트")
+                        st.line_chart(ddf.set_index("date")[["close"]])
 
-st.divider()
-st.markdown(
-    """
-    **실행 방법**
-    1. `pip install streamlit yfinance pandas numpy plotly requests`
-    2. `streamlit run kiwoom_mock_realtime_top5.py`
-    3. 키움 App Key / Secret Key를 넣으면 키움 모의실시간 현재가를 우선 사용
-    """
-)
+                    st.markdown("#### 뉴스 분석")
+                    for n in result["news_titles"]:
+                        st.write("- " + n)
+
+                    st.markdown("#### 공시 분석")
+                    for d in result["disclosures"]:
+                        st.write("- " + d)
+
+                except Exception as e:
+                    st.error(f"분석 중 오류가 발생했습니다: {e}")
+
+# ---- Watchlist tab
+with tab_watch:
+    st.subheader("관심종목")
+    st.caption("watchlist.txt 또는 WATCHLIST_CODES 환경변수를 기준으로 관심종목을 보여줍니다.")
+
+    watch_items = load_watchlist_file()
+    if WATCHLIST_CODES:
+        for code in [x.strip() for x in WATCHLIST_CODES.split(",") if x.strip()]:
+            if not any(code == c for c, _ in watch_items):
+                watch_items.append((code, build_universe().get(code, code)))
+
+    if not watch_items:
+        st.info("watchlist.txt 또는 WATCHLIST_CODES 가 비어 있습니다.")
+    else:
+        if st.button("관심종목 새로고침", key="wl_refresh"):
+            st.cache_data.clear()
+            st.rerun()
+
+        rows = []
+        progress = st.progress(0)
+        for i, (code, name) in enumerate(watch_items[:20], start=1):
+            try:
+                rows.append(analyze_stock(code, name))
+            except Exception as e:
+                st.warning(f"{name}({code}) 조회 실패: {e}")
+            progress.progress(i / max(1, min(len(watch_items), 20)))
+
+        if rows:
+            wdf = rows_to_df(rows)
+            st.dataframe(wdf, use_container_width=True, hide_index=True)

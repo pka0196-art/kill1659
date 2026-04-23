@@ -1,6 +1,5 @@
-streamlit
-yfinance
-pandas
-numpy
-plotly
-requests
+streamlit>=1.36.0
+requests>=2.31.0
+pandas>=2.2.0
+Flask>=3.0.0
+websocket-client>=1.8.0
